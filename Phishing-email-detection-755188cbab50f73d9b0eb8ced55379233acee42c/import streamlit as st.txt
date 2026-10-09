@@ -1,0 +1,769 @@
+import joblib
+import streamlit as st
+import re
+import csv
+import io
+from datetime import datetime
+import imaplib
+import email
+from email.header import decode_header
+# from fpdf import FPDF   # replaced with safe import
+import numpy as np
+# Safe import for FPDF (avoid crashing if not installed)
+try:
+    from fpdf import FPDF
+    PDF_AVAILABLE = True
+except Exception:
+    FPDF = None
+    PDF_AVAILABLE = False
+# Page config with dark mode support
+st.set_page_config(
+    page_title="Phishing Email Detector",
+    page_icon="🚨",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+# Initialize session state for history and metrics
+if 'analysis_history' not in st.session_state:
+    st.session_state.analysis_history = []
+if 'total_analyzed' not in st.session_state:
+    st.session_state.total_analyzed = 0
+if 'phishing_count' not in st.session_state:
+    st.session_state.phishing_count = 0
+if 'safe_count' not in st.session_state:
+    st.session_state.safe_count = 0
+# Allowlist for trusted senders/domains to reduce false positives
+if 'allowlist_senders' not in st.session_state:
+    st.session_state.allowlist_senders = set()
+if 'allowlist_domains' not in st.session_state:
+    st.session_state.allowlist_domains = set()
+# Load model (make robust and provide a fallback dummy model/vectorizer if files missing)
+try:
+    model = joblib.load('phishing_model.pkl')
+    vectorizer = joblib.load('vectorizer.pkl')
+except Exception as e:
+    # Fallback simple vectorizer and model so the app can run without pretrained artifacts
+    class DummyVectorizer:
+        def transform(self, texts):
+            # Return texts as-is (list) so DummyModel can consume them
+            return [t if isinstance(t, str) else str(t) for t in texts]
+    class DummyModel:
+        def predict(self, X):
+            preds = []
+            for item in X:
+                txt = item.lower() if isinstance(item, str) else str(item).lower()
+                preds.append(1 if any(k in txt for k in ['verify', 'password', 'click', 'urgent', 'account', 'reset']) else 0)
+            return np.array(preds)
+        def predict_proba(self, X):
+            probs = []
+            for item in X:
+                txt = item.lower() if isinstance(item, str) else str(item).lower()
+                score = 0.85 if any(k in txt for k in ['verify', 'password', 'click', 'urgent', 'account', 'reset']) else 0.15
+                probs.append([1.0 - score, score])
+            return np.array(probs)
+    st.warning(f"Model or vectorizer not found ({e}). Using fallback heuristic model for demonstration.")
+    model = DummyModel()
+    vectorizer = DummyVectorizer()
+# Sidebar Navigation
+st.sidebar.title("🔒 Navigation")
+page = st.sidebar.radio("Select Page:", 
+    ["🏠 Email Detector", "📊 Model Metrics", "🔬 Model Diagnostics", "📚 Phishing Examples", "📋 Analysis History", "✉️ Email Integration", "⚙️ Batch Processing"])
+def extract_urls(text):
+    """Extract URLs from email text"""
+    url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+    urls = re.findall(url_pattern, text)
+    return urls
+def extract_suspicious_keywords(text):
+    """Extract suspicious keywords commonly found in phishing emails"""
+    suspicious_words = [
+        'verify', 'confirm', 'update', 'click here', 'urgent', 'act now',
+        'expire', 'suspended', 'limited time', 'claim', 'reset password',
+        'validate', 'authenticate', 'confirm identity', 'unusual activity',
+        'account locked', 'take action'
+    ]
+    found_keywords = []
+    text_lower = text.lower()
+    # Use word-boundary matching to reduce false positives from substrings
+    for word in suspicious_words:
+        pattern = r"\b" + re.escape(word) + r"\b"
+        if re.search(pattern, text_lower):
+            found_keywords.append(word)
+    return found_keywords
+def check_sender_domain(email_text):
+    """Extract and check sender domain (case-insensitive)"""
+    from_pattern = r'from:\s*([^\n]+@[^\s]+)'
+    matches = re.findall(from_pattern, email_text, flags=re.IGNORECASE)
+    return matches
+def get_confidence_score(prediction=None, prediction_proba=None):
+    """Get model confidence score (helper)"""
+    if prediction_proba is not None:
+        try:
+            return max(prediction_proba) * 100
+        except:
+            return 50.0
+    return 50.0
+def extract_advanced_features(email_text):
+    """Extract advanced features for improved accuracy"""
+    features = {
+        'has_misspelled_domains': 0,
+        'suspicious_spelling_count': 0,
+        'has_html_tags': 0,
+        'excessive_capitalization': 0,
+        'has_attachments_mention': 0,
+        'has_urgent_language': 0,
+        'url_domain_mismatch': 0,
+    }
+    text_lower = email_text.lower()
+    # Check for common misspelled domains (homograph attacks)
+    misspelled_domains = ['paypa.l', 'amazo.n', 'microso.ft', 'app1e', 'g00gle']
+    for domain in misspelled_domains:
+        if domain in text_lower:
+            features['has_misspelled_domains'] += 1
+    # Check for suspicious misspellings
+    misspellings = ['veify', 'confim', 'urgnet', 'imidiate', 'immediat']
+    for word in misspellings:
+        if word in text_lower:
+            features['suspicious_spelling_count'] += 1
+    # Check for HTML tags (spam/phishing often use HTML)
+    if '<a ' in email_text or '<form' in email_text or 'onclick' in text_lower:
+        features['has_html_tags'] += 1
+    # Check for excessive capitalization (spam indicator)
+    caps_ratio = sum(1 for c in email_text if c.isupper()) / max(len(email_text), 1)
+    if caps_ratio > 0.3:
+        features['excessive_capitalization'] = 1
+    # Check for attachments mention
+    if any(word in text_lower for word in ['attached', 'attachment', 'download file', 'open attachment']):
+        features['has_attachments_mention'] = 
+    # Check for urgent/threatening language patterns
+    urgent_patterns = [
+        'confirm within', 'verify within', 'action required within',
+        'will be locked', 'will be closed', 'must act', 'do not ignore',
+        'failure to', 'compromise', 'security threat'
+    ]
+    for pattern in urgent_patterns:
+        if pattern in text_lower:
+            features['has_urgent_language'] += 1
+    return features
+def calculate_risk_score(email_text):
+    """Calculate risk score based on heuristics"""
+    risk_score = 0
+    risk_factors = []
+    text_lower = email_text.lower()
+    # Advanced features analysis
+    advanced_features = extract_advanced_features(email_text)
+    if advanced_features['has_misspelled_domains']:
+        risk_score += 40
+        risk_factors.append(f"🚨 Misspelled domain detected - likely homograph attack")
+    if advanced_features['suspicious_spelling_count']:
+        risk_score += 25
+        risk_factors.append(f"⚠️ Suspicious misspellings detected ({advanced_features['suspicious_spelling_count']})")
+    if advanced_features['has_html_tags']:
+        risk_score += 15
+        risk_factors.append(f"📄 HTML/Form tags detected in email body")
+    
+    if advanced_features['excessive_capitalization']:
+        risk_score += 10
+        risk_factors.append(f"📢 Excessive capitalization detected")
+    if advanced_features['has_attachments_mention']:
+        risk_score += 20
+        risk_factors.append(f"📎 Suspicious attachment reference")
+    if advanced_features['has_urgent_language']:
+        risk_score += advanced_features['has_urgent_language'] * 15
+        risk_factors.append(f"🚨 Urgent/threatening language detected ({advanced_features['has_urgent_language']} instances)")
+    # CRITICAL PHISHING INDICATORS (immediate red flags)
+    critical_indicators = {
+        'verify account': 30,
+        'confirm identity': 30,
+        'reset password': 35,
+        'click here': 25,
+    }
+    for indicator, points in critical_indicators.items():
+        if indicator in text_lower:
+            risk_score += points
+            risk_factors.append(f"⚠️ CRITICAL: '{indicator}' detected")
+    ]
+    keyword_matches = 0
+    for kw in suspicious_keywords:
+        if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+            keyword_matches += 1
+    if keyword_matches > 0:
+        # SIGNIFICANTLY REDUCE per-keyword weight to avoid false positives
+        keyword_points = min(20, keyword_matches * 3)  # Reduced from 6 to 3, max 20 instead of 40
+        risk_score += keyword_points
+        risk_factors.append(f"🚩 Business keywords: {keyword_matches} found ({keyword_points} pts)")
+    # PHISHING PATTERNS - URLS (REDUCED WEIGHT for legitimate emails with links)
+    urls = extract_urls(email_text)
+    if urls:
+        # Only penalize if many URLs or suspicious shorteners
+        url_points = min(15, len(urls) * 5)  # Reduced from 15 per URL
+        risk_score += url_points
+        risk_factors.append(f"🔗 URLs detected: {len(urls)} ({url_points} pts)")
+        # Check for suspicious URL patterns
+        for url in urls:
+            if any(x in url.lower() for x in ['bit.ly', 'tinyurl', 'short.url', 'bit.', 'url.']):
+                risk_score += 20
+                risk_factors.append(f"⚠️ SHORTENED URL: {url}")
+    # GENERIC GREETINGS (REDUCED - common in legitimate newsletters)
+    generic_greetings = ['dear customer', 'dear user', 'hello user', 'dear member', 'dear sir', 'dear madam', 'valued customer']
+    for greeting in generic_greetings:
+        if greeting in text_lower:
+            risk_score += 5  # Reduced from 25
+            risk_factors.append(f"👤 Generic greeting: '{greeting}'")
+            break
+    # URGENCY/TIME PRESSURE (REDUCED - common in legitimate business)
+    urgency_words = ['urgent', 'immediately', 'asap', '24 hour', '48 hour', 'expire', 'expired', 'ending soon', 'limited time']
+    urgency_count = 0
+    for word in urgency_words:
+        if word in text_lower:
+            urgency_count += 1
+    if urgency_count > 0:
+        risk_score += min(10, urgency_count * 3)  # Reduced significantly from 20 each
+        risk_factors.append(f"⏰ Urgency language: {urgency_count} found")
+    # REQUESTING SENSITIVE INFO (keep high - this IS a strong phishing indicator)
+    sensitive_info = ['password', 'credit card', 'social security', 'ssn', 'pin', 'cvv', 'bank account', 'login credential']
+    sensitive_count = 0
+    for info in sensitive_info:
+        if info in text_lower:
+            sensitive_count += 1
+    if sensitive_count > 0:
+        risk_score += sensitive_count * 25  # Keep this high
+        risk_factors.append(f"🔐 Requests sensitive info: {sensitive_count} type(s)")
+    # SENDER DOMAIN ISSUES (check allowlist and suspicious patterns)
+    senders = check_sender_domain(email_text)
+    if senders:
+        for sender in senders:
+            if '@' in sender:
+                domain = sender.split('@')[-1].lower()
+                local = sender.split('@')[0].lower()
+                # allowlist check: if sender or domain is trusted, reduce risk
+                if domain in st.session_state.allowlist_domains or sender.lower() in st.session_state.allowlist_senders or local in st.session_state.allowlist_senders:
+                    risk_factors.append(f"✅ Sender/domain whitelisted: {sender}")
+                    continue
+                # Common spoofed domains
+                if any(x in domain for x in ['paypa.', 'amazn', 'googl', 'microsoft.', 'apple.', '.tk', '.ml']):
+                    risk_score += 35
+                    risk_factors.append(f"⚠️ SUSPICIOUS DOMAIN: {domain}")
+    # LENGTH CHECK - Very short emails are often phishing
+    if len(email_text) < 100:
+        risk_score += 15
+        risk_factors.append("📏 Email is unusually short")
+    if not any(word in text_lower for word in ['mr.', 'mrs.', 'ms.', 'dr.', 'name', 'account number']):
+        risk_score += 10
+        risk_factors.append("📭 No personalization detected")
+    return min(100, risk_score), risk_factors
+def analyze_email(email_text):
+    """Analyze email for phishing using ML model + heuristics - IMPROVED"""
+    try:
+        # ML Model prediction
+        vectorizer_input = vectorizer.transform([email_text])
+        prediction = model.predict(vectorizer_input)
+        # Get ML confidence and probability
+        ml_confidence = 50.0
+        ml_proba = [0.5, 0.5]
+        try:
+            if hasattr(model, 'predict_proba'):
+                ml_proba = model.predict_proba(vectorizer_input)[0]
+                ml_confidence = max(ml_proba) * 100
+        except:
+            ml_confidence = 50.0 
+        ml_is_phishing = prediction[0] == 1
+        ml_phishing_prob = ml_proba[1] if len(ml_proba) > 1 else 0.5
+        # Heuristic-based risk scoring
+        heuristic_risk, risk_factors = calculate_risk_score(email_text)
+        # Check if sender/domain is allowlisted
+        try:
+            senders = check_sender_domain(email_text)
+            whitelisted = False
+            for s in senders:
+                if '@' in s:
+                    domain = s.split('@')[-1].lower()
+                    if domain in st.session_state.allowlist_domains or s.lower() in st.session_state.allowlist_senders:
+                        whitelisted = True
+                        break
+        except Exception:
+            whitelisted = False      
+        # Extract analysis data
+        urls = extract_urls(email_text)
+        suspicious_keywords = extract_suspicious_keywords(email_text)
+        sender_info = check_sender_domain(email_text)
+        result = {
+            'is_phishing': is_phishing,
+            'confidence': min(99.5, max(0.5, combined_confidence)),
+            'ml_confidence': ml_confidence,
+            'heuristic_risk': heuristic_risk,
+            'risk_factors': risk_factors,
+            'urls': urls,
+            'suspicious_keywords': suspicious_keywords,
+            'sender_info': sender_info,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'email_preview': email_text[:100] + "..." if len(email_text) > 100 else email_text
+        }  
+        return result
+    except Exception as e:
+        st.error(f"Error analyzing email: {e}")
+        return None
+# Ensure PDF generation gracefully handles missing FPDF
+def generate_pdf_report(results):
+    """Generate PDF report of analysis"""
+    if not PDF_AVAILABLE:
+        raise RuntimeError("FPDF not available. Install 'fpdf' to enable PDF export.")
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "Phishing Email Detection Report", ln=True, align="C")
+    pdf.set_font("Arial", "", 11)
+    pdf.ln(10)   
+    for idx, result in enumerate(results, 1):
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, f"Email {idx}", ln=True)   
+        pdf.set_font("Arial", "", 10)
+        pdf.multi_cell(0, 5, f"Status: {'PHISHING' if result['is_phishing'] else 'SAFE'}")
+        pdf.multi_cell(0, 5, f"Confidence: {result['confidence']:.2f}%")
+        pdf.multi_cell(0, 5, f"Timestamp: {result['timestamp']}")        
+        if result['urls']:
+            pdf.multi_cell(0, 5, f"URLs Found: {', '.join(result['urls'][:3])}")
+        if result['suspicious_keywords']:
+            pdf.multi_cell(0, 5, f"Suspicious Keywords: {', '.join(result['suspicious_keywords'][:5])}")        
+        pdf.ln(5)    
+    return pdf.output(dest='S').encode('latin-1')
+def generate_csv_report(results):
+    """Generate CSV report of analysis"""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Timestamp', 'Status', 'Confidence (%)', 'URLs Found', 'Suspicious Keywords', 'Preview'])   
+    for result in results:
+        writer.writerow([
+            result['timestamp'],
+            'PHISHING' if result['is_phishing'] else 'SAFE',
+            f"{result['confidence']:.2f}",
+            len(result['urls']),
+            len(result['suspicious_keywords']),
+            result['email_preview']
+        ])    
+    return output.getvalue().encode('utf-8')
+#  PAGE: EMAIL DETECTOR
+if page == "🏠 Email Detector":
+    st.title('🚨 Phishing Email Detector')   
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Analyzed", st.session_state.total_analyzed)
+    with col2:
+        st.metric("Phishing Detected", st.session_state.phishing_count)
+    with col3:
+        st.metric("Safe Emails", st.session_state.safe_count)    
+    st.divider()    
+    st.write("Choose how to provide the email content:")
+    input_method = st.radio("Select input method:", ('Paste Email Text', 'Upload .txt File'))    
+    email_text = ''    
+    if input_method == 'Paste Email Text':
+        email_text = st.text_area("Paste the email content below:", height=200)
+    elif input_method == 'Upload .txt File':
+        uploaded_file = st.file_uploader('Choose a .txt file', type=['txt'])
+        if uploaded_file is not None:
+            try:
+                email_text = uploaded_file.read().decode('utf-8')
+                st.success("✅ File uploaded successfully")
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+    if st.button('🔍 Check Email', use_container_width=True):
+        if email_text.strip() == '':
+            st.warning("Please provide email content")
+        else:
+            result = analyze_email(email_text)            
+            if result:
+                st.session_state.total_analyzed += 1                
+                # Main prediction with color coding
+                if result['is_phishing']:
+                    st.session_state.phishing_count += 1
+                    st.error(f"⚠️ **PHISHING DETECTED** - Confidence: {result['confidence']:.2f}%")
+                else:
+                    st.session_state.safe_count += 1
+                    st.success(f"✅ **SAFE EMAIL** - Confidence: {result['confidence']:.2f}%")             
+                # Detailed Analysis
+                st.divider()
+                st.subheader("📋 Detailed Analysis")                
+                # Show both ML and Heuristic scores
+                col1, col2, col3 = st.columns(3)                
+                with col1:
+                    st.write("**Combined Confidence:**")
+                    st.progress(result['confidence'] / 100)
+                    st.caption(f"{result['confidence']:.2f}%")
+                    with col2:
+                    st.write("**ML Model Confidence:**")
+                    st.progress(result['ml_confidence'] / 100)
+                    st.caption(f"{result['ml_confidence']:.2f}%")            
+                with col3:
+                    st.write("**Heuristic Risk Score:**")
+                    st.progress(result['heuristic_risk'] / 100)
+                    st.caption(f"{result['heuristic_risk']:.2f}%")                
+                # Risk Factors
+                if result['risk_factors']:
+                    st.subheader("⚠️ Risk Factors Detected")
+                    for factor in result['risk_factors']:
+                        st.warning(f"🚩 {factor}")            
+                # URLs Found
+                if result['urls']:
+                    st.subheader("🔗 URLs Detected")
+                    for url in result['urls']:
+                        st.warning(f"Found URL: `{url}`")                
+                # Suspicious Keywords
+                if result['suspicious_keywords']:
+                    st.subheader("⚠️ Suspicious Keywords Found")
+                    keywords_display = ", ".join(result['suspicious_keywords'])
+                    st.info(f"**Keywords:** {keywords_display}")                
+                # Sender Info
+                if result['sender_info']:
+                    st.subheader("👤 Sender Information")
+                    for sender in result['sender_info']:
+                        st.write(f"**From:** {sender}")
+                
+                st.write(f"**Analyzed at:** {result['timestamp']}")                
+                # Save to history
+                st.session_state.analysis_history.append(result)
+                # Allow user to mark sender/domain as safe to reduce future false positives
+                sender_list = result.get('sender_info') or []
+                sender_display = sender_list[0] if len(sender_list) > 0 else None
+                col_action1, col_action2 = st.columns(2)
+                with col_action1:
+                    if sender_display and st.button('✅ Mark Sender as Safe', key=f'mark_safe_sender_{len(st.session_state.analysis_history)}'):
+                        try:
+                            st.session_state.allowlist_senders.add(sender_display.lower())
+                            st.success(f'Added {sender_display} to sender allowlist')
+                        except Exception:
+                            st.error('Unable to add sender to allowlist')
+                with col_action2:
+                    if sender_display:
+                        domain = sender_display.split('@')[-1] if '@' in sender_display else None
+                        if domain and st.button('✅ Add Domain to Allowlist', key=f'add_allow_domain_{len(st.session_state.analysis_history)}'):
+                            try:
+                                st.session_state.allowlist_domains.add(domain.lower())
+                                st.success(f'Added {domain} to domain allowlist')
+                            except Exception:
+                                st.error('Unable to add domain to allowlist')
+#  PAGE: MODEL METRICS 
+elif page == "📊 Model Metrics":
+    st.title("📊 Model Performance Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Emails Analyzed", st.session_state.total_analyzed)
+    with col2:
+        st.metric("Phishing Count", st.session_state.phishing_count)
+    with col3:
+        st.metric("Safe Count", st.session_state.safe_count)
+    with col4:
+        if st.session_state.total_analyzed > 0:
+            phishing_rate = (st.session_state.phishing_count / st.session_state.total_analyzed) * 100
+            st.metric("Phishing Rate (%)", f"{phishing_rate:.1f}%")    
+    st.divider()    
+    st.subheader("📈 Model Information")
+    col1, col2 = st.columns(2)    
+    with col1:
+        st.info(f"""
+        **Model Type:** Logistic Regression
+        **Vectorizer:** TF-IDF (max 5000 features)
+        **Status:** Active and Ready
+        """)    
+    with col2:
+        st.success(f"""
+        **Detection Method:** Hybrid (ML + Heuristics)
+        **Features:** ML confidence + Risk scoring
+        **Threshold:** Dynamic based on risk factors
+        """)
+#PAGE: MODEL DIAGNOSTICS
+elif page == "🔬 Model Diagnostics":
+    st.title("🔬 Model Diagnostics & Testing")  
+    st.write("Test the model with known phishing and legitimate emails to verify accuracy")    
+    col1, col2 = st.columns(2)    
+    with col1:
+        st.subheader("🚨 Test Phishing Detection")
+        phishing_test = st.text_area("Enter a phishing email to test:", height=150, key="phishing_test")       
+        if st.button("Test Phishing Email", key="test_phishing"):
+            if phishing_test.strip():
+                result = analyze_email(phishing_test)
+                if result:
+                    st.write(f"**Result:** {'🚨 PHISHING' if result['is_phishing'] else '✅ SAFE'}")
+                    st.write(f"**Combined Confidence:** {result['confidence']:.2f}%")
+                    st.write(f"**ML Confidence:** {result['ml_confidence']:.2f}%")
+                    st.write(f"**Heuristic Risk:** {result['heuristic_risk']:.2f}%")                    
+                    if result['risk_factors']:
+                        st.write("**Risk Factors:**")
+                        for factor in result['risk_factors']:
+                            st.write(f"  • {factor}")
+    with col2:
+        st.subheader("✅ Test Legitimate Detection")
+        legitimate_test = st.text_area("Enter a legitimate email to test:", height=150, key="legitimate_test")        
+        if st.button("Test Legitimate Email", key="test_legitimate"):
+            if legitimate_test.strip():
+                result = analyze_email(legitimate_test)
+                if result:
+                    st.write(f"**Result:** {'🚨 PHISHING' if result['is_phishing'] else '✅ SAFE'}")
+                    st.write(f"**Combined Confidence:** {result['confidence']:.2f}%")
+                    st.write(f"**ML Confidence:** {result['ml_confidence']:.2f}%")
+                    st.write(f"**Heuristic Risk:** {result['heuristic_risk']:.2f}%")               
+                    if result['risk_factors']:
+                        st.write("**Risk Factors:**")
+                        for factor in result['risk_factors']:
+                            st.write(f"  • {factor}")    
+    st.divider()
+    st.subheader("📌 Model Improvement Tips")
+# PAGE: PHISHING EXAMPLES 
+elif page == "📚 Phishing Examples":
+    st.title("📚 Common Phishing Email Examples")    
+    st.info("⚠️ **Educational Section** - Real examples of phishing techniques to help you identify them")    
+    examples = [
+        {
+            "title": "Urgent Account Verification",
+            "content": """From: security@paypa1.com
+Subject: Urgent: Verify Your Account
+Dear Customer,
+Your PayPal account has been flagged for unusual activity. 
+Please click here to verify your account immediately.
+This link will expire in 24 hours. Act now!""",
+            "red_flags": ["Urgent language", "Misspelled domain (paypa1 instead of paypal)", "Pressure to act", "Generic greeting"]
+        },
+        {
+            "title": "Prize Winner Scam",
+            "content": """From: lottery@winnings.co
+Subject: You've Won $50,000!
+Congratulations! You have been randomly selected to receive $50,000.
+Click here to claim your prize: http://suspicious-link.com/claim
+You must act within 48 hours or forfeit your prize.""",
+            "red_flags": ["Unrealistic promises", "Time pressure", "Suspicious URL", "Too good to be true"]
+        },
+        {
+            "title": "Password Reset",
+            "content": """From: noreply@amazon.com
+Subject: Reset Your Amazon Password
+Hello,
+We noticed unusual login attempts on your account.
+Please reset your password immediately by clicking the link below.
+https://amaz0n-security-check.com/reset""",
+            "red_flags": ["Suspicious domain variation", "Security threat mentioned", "Fake link", "Creating urgency"]
+        }
+    ]
+    for idx, example in enumerate(examples, 1):
+        with st.expander(f"📧 Example {idx}: {example['title']}", expanded=False):
+            st.code(example['content'], language="text")
+            st.subheader("🚩 Red Flags:")
+            for flag in example['red_flags']:
+                st.warning(f"• {flag}")
+#PAGE: ANALYSIS HISTORY 
+elif page == "📋 Analysis History":
+    st.title("📋 Analysis History")    
+    if len(st.session_state.analysis_history) == 0:
+        st.info("No analysis history yet. Start analyzing emails to build history.")
+    else:
+        st.subheader(f"Total Analyses: {len(st.session_state.analysis_history)}")        
+        # Display history
+        for idx, analysis in enumerate(reversed(st.session_state.analysis_history), 1):
+            with st.expander(f"Analysis {idx} - {analysis['timestamp']}", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    status = "🚨 PHISHING" if analysis['is_phishing'] else "✅ SAFE"
+                    st.write(f"**Status:** {status}")
+                    st.write(f"**Confidence:** {analysis['confidence']:.2f}%")
+                with col2:
+                    st.write(f"**URLs Found:** {len(analysis['urls'])}")
+                    st.write(f"**Suspicious Keywords:** {len(analysis['suspicious_keywords'])}")             
+                st.write(f"**Preview:** {analysis['email_preview']}")        
+        st.divider()        
+        # Export options
+        st.subheader("📥 Export Analysis")
+        col1, col2 = st.columns(2)     
+        with col1:
+            csv_data = generate_csv_report(st.session_state.analysis_history)
+            st.download_button(
+                label="📊 Download as CSV",
+                data=csv_data,
+          file_name=f"phishing_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )     
+        with col2:
+            try:
+                pdf_data = generate_pdf_report(st.session_state.analysis_history)
+                st.download_button(
+                    label="📄 Download as PDF",
+                    data=pdf_data,
+                    file_name=f"phishing_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf"
+                )
+            except:
+                st.warning("PDF generation requires additional setup")        
+        if st.button("🗑️ Clear History"):
+            st.session_state.analysis_history = []
+            st.rerun()
+#  PAGE: BATCH PROCESSING 
+elif page == "⚙️ Batch Processing":
+    st.title("⚙️ Batch Email Processing")   
+    st.write("Upload a file with multiple emails (one email per line) for batch analysis")
+    uploaded_batch = st.file_uploader('Choose a .txt file with emails (one per line):', type=['txt'])
+    if uploaded_batch is not None:
+        try:
+            batch_content = uploaded_batch.read().decode('utf-8')
+            emails = [line.strip() for line in batch_content.splitlines() if line.strip()]        
+            st.success(f"✅ Loaded {len(emails)} emails for analysis")
+            if st.button("🚀 Analyze Batch Emails"):
+                results = []
+                for email in emails:
+                    result = analyze_email(email)
+                    if result:
+                        results.append(result)
+                        st.session_state.total_analyzed += 1
+                        if result['is_phishing']:
+                            st.session_state.phishing_count += 1
+                        else:
+                            st.session_state.safe_count += 1      
+                st.success(f"✅ Analyzed {len(results)} emails")                
+                # Show summary
+                phishing_detected = sum(1 for r in results if r['is_phishing'])
+                safe_detected = len(results) - phishing_detected             
+                st.write(f"**Phishing Detected:** {phishing_detected}")
+                st.write(f"**Safe Emails:** {safe_detected}")            
+                # Save to history
+                st.session_state.analysis_history.extend(results)                
+                # Export options
+                st.subheader("📥 Export Batch Analysis")
+                col1, col2 = st.columns(2)              
+                with col1:
+                    csv_data = generate_csv_report(results)
+                    st.download_button(
+                        label="📊 Download Batch CSV",
+                        data=csv_data,                        file_name=f"batch_phishing_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )                
+                with col2:
+                    try:
+                        pdf_data = generate_pdf_report(results)
+                        st.download_button(
+                            label="📄 Download Batch PDF",
+                            data=pdf_data,                            file_name=f"batch_phishing_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                            mime="application/pdf"
+                        )
+                    except:
+                        st.warning("PDF generation requires additional setup")   
+        except Exception as e:
+           st.error(f"Error processing batch file: {e}")
+# IMAP helper functions (ensure available before Email Integration page)
+def _decode_mime_words(s):
+    try:
+        parts = decode_header(s or '')
+    except Exception:
+        return s or ''
+    decoded = ''
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            try:
+                decoded += part.decode(enc or 'utf-8', errors='ignore')
+            except Exception:
+                decoded += part.decode('utf-8', errors='ignore')
+        else:
+            decoded += part
+    return decoded
+def fetch_unread_emails(imap_server, username, password, mailbox='INBOX', limit=10, mark_seen=True):
+    results = []
+    try:
+        imap = imaplib.IMAP4_SSL(imap_server)
+        imap.login(username, password)
+        imap.select(mailbox)
+        status, response = imap.search(None, 'UNSEEN')
+        if status != 'OK':
+            try:
+                imap.logout()
+            except Exception:
+                pass
+            return results
+        ids = response[0].split()
+        ids = ids[-limit:]
+        for num in ids:
+            try:
+                res, msg_data = imap.fetch(num, '(RFC822)')
+                if res != 'OK':
+                    continue
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+                subject = _decode_mime_words(msg.get('Subject', ''))
+                from_ = _decode_mime_words(msg.get('From', ''))
+                body = ''
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ctype = part.get_content_type()
+                        disp = str(part.get('Content-Disposition'))
+                        if ctype == 'text/plain' and 'attachment' not in disp:
+                            try:
+                                body_bytes = part.get_payload(decode=True)
+                                body = body_bytes.decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                                break
+                            except Exception:
+                                continue
+                    if not body:
+                        for part in msg.walk():
+                            if part.get_content_type() == 'text/html':
+                                body_bytes = part.get_payload(decode=True)
+                                body = body_bytes.decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                                break
+                else:
+                    body_bytes = msg.get_payload(decode=True)
+                    if body_bytes:
+                        body = body_bytes.decode(msg.get_content_charset() or 'utf-8', errors='ignore')
+                    else:
+                        body = str(msg.get_payload())
+                results.append({'subject': subject, 'from': from_, 'body': body})
+                if mark_seen:
+                    try:
+                        imap.store(num, '+FLAGS', '\\Seen')
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        try:
+            imap.close()
+        except Exception:
+            pass
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    except Exception as e:
+        msg = str(e)
+#  PAGE: EMAIL INTEGRATION
+if page == "✉️ Email Integration":
+    st.title("✉️ Email Integration & Inbox Monitoring")
+    st.write("Connect an IMAP email account to fetch unread emails and analyze them for phishing.")
+    with st.form(key='email_connect_form'):
+        imap_server = st.text_input('IMAP Server (e.g. imap.gmail.com)')
+        email_user = st.text_input('Email Address')
+        email_pass = st.text_input('Password / App Password', type='password')
+        mailbox = st.text_input('Mailbox', value='INBOX')
+        max_emails = st.number_input('Max emails to fetch', min_value=1, max_value=100, value=10)
+        mark_seen = st.checkbox('Mark messages as seen after processing', value=True)
+        submit_conn = st.form_submit_button('🔌 Check Inbox Now')
+    if submit_conn:
+        if not imap_server or not email_user or not email_pass:
+            st.warning('Please provide IMAP server, email, and password.')
+        else:
+            with st.spinner('Connecting and fetching unread emails...'):
+                fetched = fetch_unread_emails(imap_server.strip(), email_user.strip(), email_pass, mailbox=mailbox.strip(), limit=int(max_emails), mark_seen=mark_seen)
+            if not fetched:
+                st.info('No unread emails found or unable to fetch.')
+            else:
+                st.success(f'Fetched {len(fetched)} unread emails')
+                new_results = []
+                for idx, mail in enumerate(fetched, 1):
+                    content = f"From: {mail.get('from')}\nSubject: {mail.get('subject')}\n\n{mail.get('body','')}"
+                    result = analyze_email(content)
+                    if result:
+                        new_results.append(result)
+                        st.session_state.analysis_history.append(result)
+                        st.session_state.total_analyzed += 1
+                        if result['is_phishing']:
+                            st.session_state.phishing_count += 1
+                            st.warning(f"#{idx} PHISHING: {mail.get('subject')} - Confidence: {result['confidence']:.2f}%")
+                        else:
+                            st.success(f"#{idx} SAFE: {mail.get('subject')} - Confidence: {result['confidence']:.2f}%")
+                st.divider()
+                st.subheader('Inbox Analysis Summary')
+                phishing_detected = sum(1 for r in new_results if r['is_phishing'])
+                safe_detected = len(new_results) - phishing_detected
+                st.write(f"**Phishing Detected:** {phishing_detected}")
+                st.write(f"**Safe Emails:** {safe_detected}")
+                st.write('Results added to analysis history.')
